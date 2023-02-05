@@ -6,7 +6,9 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"net"
+	"strings"
 	"sync"
 
 	log "github.com/sirupsen/logrus"
@@ -21,7 +23,10 @@ type keyValueServer struct {
 	ctx      context.Context
 	cancel   context.CancelFunc
 	conns    map[net.Conn]int
+	aliveCnt int
+	disCnt   int
 	mtx      sync.Mutex
+	kvMtx    sync.Mutex
 }
 
 // New creates and returns (but does not start) a new KeyValueServer.
@@ -54,26 +59,59 @@ func (kvs *keyValueServer) listening() {
 			return
 		}
 
+		log.WithField("conn remote", conn.RemoteAddr().String()).Info("new conn come")
+
 		kvs.mtx.Lock()
 		kvs.conns[conn] = 1
+		kvs.aliveCnt += 1
 		kvs.mtx.Unlock()
 
-		go processConn(conn)
+		go kvs.processConn(conn)
 
 	}
 }
 
-func processConn(conn net.Conn) {
+func (kvs *keyValueServer) processConn(conn net.Conn) {
 	for {
 		reader := bufio.NewReader(conn)
 		var buf [128]byte
 		n, err := reader.Read(buf[:]) // 读取数据
+		if err == io.EOF {
+			kvs.mtx.Lock()
+			conn.Close()
+			kvs.disCnt += 1
+			kvs.aliveCnt -= 1
+			kvs.mtx.Unlock()
+
+			log.WithField("alive cnt", kvs.aliveCnt).WithField("dis cnt", kvs.disCnt).Info("")
+			return
+		}
 		if err != nil {
 			fmt.Println("read from client failed, err: ", err)
-			break
+			continue
 		}
 		recvStr := string(buf[:n])
-		conn.Write([]byte(recvStr)) // 发送数据
+		recvStr = strings.Trim(recvStr, "\n")
+
+		cmd, err := parseCommand(recvStr)
+		if err != nil {
+			log.WithError(err).Error("parseCommand failed")
+			return
+		}
+
+		if cmd.Op == "Get" {
+			kvs.kvMtx.Lock()
+			vs := kvs.kvStore.Get(cmd.Key)
+			kvs.kvMtx.Unlock()
+
+			for i := range vs {
+				msg := composeGetMsg(cmd.Key, vs[i])
+				conn.Write(msg)
+			}
+		} else if cmd.Op == "Debug" {
+			conn.Write([]byte(recvStr))
+		}
+
 		log.WithField("recvStr", recvStr).Info("")
 	}
 }
@@ -109,12 +147,12 @@ func (kvs *keyValueServer) Close() {
 
 func (kvs *keyValueServer) CountActive() int {
 	// TODO: implement this!
-	return -1
+	return kvs.aliveCnt
 }
 
 func (kvs *keyValueServer) CountDropped() int {
 	// TODO: implement this!
-	return -1
+	return kvs.disCnt
 }
 
 // TODO: add additional methods/functions below!
